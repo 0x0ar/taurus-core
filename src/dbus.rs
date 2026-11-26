@@ -1,0 +1,1410 @@
+//! The objects served on the session bus. Feeds sample only while some client holds a lease,
+//! taken with `Subscribe` and ended by `Unsubscribe` or by the client leaving the bus.
+
+use std::collections::HashMap;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use zbus::fdo::{RequestNameFlags, RequestNameReply};
+use zbus::message::Header;
+use zbus::zvariant::Value;
+use zbus::{fdo, interface};
+
+use crate::brightness::{self, Backend, Change, Ddc};
+use crate::clipboard;
+use crate::compositor::{self, Session, Waker};
+use crate::history::{self, History};
+use crate::idle::{self, Event, Inhibition, SleepLock};
+use crate::leases::Leases;
+use crate::locks::{self, Locks};
+use crate::network;
+use crate::screentime::{self, Notified, Tracker};
+use crate::sysinfo::{Sampler, Usage};
+
+pub const BUS_NAME: &str = "org.taurus.Core";
+pub const CORE_INTERFACE: &str = "org.taurus.Core";
+pub const SYSINFO_PATH: &str = "/sysinfo";
+pub const SYSINFO_INTERFACE: &str = "org.taurus.Core.SysInfo";
+pub const LOCKS_PATH: &str = "/locks";
+pub const LOCKS_INTERFACE: &str = "org.taurus.Core.Locks";
+pub const CLIPBOARD_PATH: &str = "/clipboard";
+pub const CLIPBOARD_INTERFACE: &str = "org.taurus.Core.Clipboard";
+pub const BRIGHTNESS_PATH: &str = "/brightness";
+pub const BRIGHTNESS_INTERFACE: &str = "org.taurus.Core.Brightness";
+pub const IDLE_PATH: &str = "/idle";
+pub const IDLE_INTERFACE: &str = "org.taurus.Core.Idle";
+pub const SCREENTIME_PATH: &str = "/screentime";
+pub const SCREENTIME_INTERFACE: &str = "org.taurus.Core.ScreenTime";
+pub const COMPOSITOR_PATH: &str = "/compositor";
+pub const COMPOSITOR_INTERFACE: &str = "org.taurus.Core.Compositor";
+pub const NETWORK_PATH: &str = "/network";
+pub const NETWORK_INTERFACE: &str = "org.taurus.Core.Network";
+const PROPERTIES_INTERFACE: &str = "org.freedesktop.DBus.Properties";
+const MIN_INTERVAL: Duration = Duration::from_millis(100);
+const PRIMING: Duration = Duration::from_millis(250);
+const HISTORY_STEP: Duration = Duration::from_secs(1);
+const DEVICE_SETTLE: Duration = Duration::from_millis(500);
+/// How long to wait before connecting again to a compositor that went away
+const RECONNECT: Duration = Duration::from_secs(1);
+/// How often the polled LEDs are looked up again, in case a keyboard came without a device event
+const LED_RESCAN: Duration = Duration::from_secs(30);
+
+type Properties = Vec<(&'static str, Value<'static>)>;
+
+fn changed(before: Properties, after: Properties) -> HashMap<&'static str, Value<'static>> {
+    after.into_iter().zip(before).filter(|((_, new), (_, old))| new != old).map(|(new, _)| new).collect()
+}
+
+fn emit(bus: &zbus::blocking::Connection, path: &str, interface: &str, changed: HashMap<&str, Value>) {
+    if changed.is_empty() {
+        return;
+    }
+    let body = (interface, changed, Vec::<&str>::new());
+    if let Err(error) = bus.emit_signal(None::<&str>, path, PROPERTIES_INTERFACE, "PropertiesChanged", &body) {
+        eprintln!("taurus-core: could not signal a change on {path}: {error}");
+    }
+}
+
+fn owner(header: &Header<'_>) -> fdo::Result<String> {
+    header.sender().map(|s| s.to_string()).ok_or_else(|| fdo::Error::Failed("the call has no sender".into()))
+}
+
+fn interval(milliseconds: u32) -> Duration {
+    Duration::from_millis(milliseconds.into()).max(MIN_INTERVAL)
+}
+
+#[derive(Default)]
+struct SysState {
+    usage: Usage,
+    samples: u64,
+}
+
+impl SysState {
+    fn properties(&self) -> Properties {
+        let u = &self.usage;
+        vec![
+            ("Cpu", u.cpu.into()),
+            ("RamPercent", u.ram_percent.into()),
+            ("RamGb", u.ram_gb.into()),
+            ("Temp", u.temp.into()),
+            ("NetRx", u.net_rx.into()),
+            ("NetTx", u.net_tx.into()),
+            ("DiskPercent", u.disk.percent.into()),
+            ("DiskUsedGb", u.disk.used_gb.into()),
+            ("DiskTotalGb", u.disk.total_gb.into()),
+            ("Samples", self.samples.into()),
+        ]
+    }
+}
+
+struct HistoryState {
+    history: History,
+    next_sample: Instant,
+}
+
+pub struct SysFeed {
+    pub leases: Leases,
+    state: Mutex<SysState>,
+    history: Mutex<HistoryState>,
+}
+
+impl SysFeed {
+    pub fn new() -> Arc<SysFeed> {
+        Arc::new(SysFeed {
+            leases: Leases::default(),
+            state: Mutex::default(),
+            history: Mutex::new(HistoryState { history: History::default(), next_sample: Instant::now() }),
+        })
+    }
+
+    /// Adds a sample to the history every second, forever, leased or not
+    pub fn run_history(&self) {
+        let mut sampler = Sampler::system();
+        sampler.load();
+        let mut next = Instant::now() + HISTORY_STEP;
+        loop {
+            std::thread::sleep(next.saturating_duration_since(Instant::now()));
+            let load = sampler.load();
+            next += HISTORY_STEP;
+            if next < Instant::now() {
+                next = Instant::now() + HISTORY_STEP;
+            }
+            let mut state = self.history.lock().unwrap();
+            state.history.push(load);
+            state.next_sample = next;
+        }
+    }
+
+    /// Samples at the shortest interval leased, forever
+    pub fn run(&self, bus: &zbus::blocking::Connection) {
+        let mut sampler = Sampler::system();
+        let mut last: Option<Instant> = None;
+        loop {
+            let every = self.leases.wait_interval();
+            // CPU and network usage are differences between two samples, so after a pause a short
+            // first measurement replaces the stale one
+            if last.is_none_or(|at| at.elapsed() > every * 3) {
+                sampler.reset_network();
+                sampler.sample(Instant::now());
+                std::thread::sleep(PRIMING);
+            }
+            let now = Instant::now();
+            last = Some(now);
+            let usage = sampler.sample(now);
+            let changes = {
+                let mut state = self.state.lock().unwrap();
+                let before = state.properties();
+                state.usage = usage;
+                state.samples += 1;
+                changed(before, state.properties())
+            };
+            emit(bus, SYSINFO_PATH, SYSINFO_INTERFACE, changes);
+            self.leases.sleep(every);
+        }
+    }
+}
+
+pub struct LockFeed {
+    pub leases: Leases,
+    state: Mutex<Locks>,
+}
+
+fn lock_properties(locks: Locks) -> Properties {
+    vec![("CapsLock", locks.caps.into()), ("NumLock", locks.num.into())]
+}
+
+impl LockFeed {
+    pub fn new() -> Arc<LockFeed> {
+        let state = locks::hyprland().unwrap_or_else(|| locks::read_leds(Path::new(locks::LEDS)));
+        Arc::new(LockFeed { leases: Leases::default(), state: Mutex::new(state) })
+    }
+
+    /// Follows the keyboards' events when they can be opened, else polls the LEDs, and looks again
+    /// whenever an input device is added or removed
+    pub fn run(&self, bus: &zbus::blocking::Connection) {
+        let watch = locks::DeviceWatch::new();
+        loop {
+            let keyboards = locks::open_keyboards();
+            if keyboards.is_empty() {
+                self.poll_leds(watch.as_ref(), bus);
+            } else {
+                self.follow(keyboards, watch.as_ref(), bus);
+            }
+            // udev names and permits a new device shortly after it appears
+            std::thread::sleep(DEVICE_SETTLE);
+        }
+    }
+
+    fn follow(
+        &self,
+        mut keyboards: Vec<std::fs::File>,
+        watch: Option<&locks::DeviceWatch>,
+        bus: &zbus::blocking::Connection,
+    ) {
+        use std::os::fd::AsRawFd;
+        while !keyboards.is_empty() {
+            let mut fds: Vec<i32> = keyboards.iter().map(|k| k.as_raw_fd()).collect();
+            fds.extend(watch.map(|w| w.fd()));
+            let Some(revents) = locks::wait_readable(&fds) else { return };
+            if watch.is_some_and(|w| revents[keyboards.len()] != 0 && w.drain()) {
+                return;
+            }
+            let mut seen = *self.state.lock().unwrap();
+            let mut index = 0;
+            keyboards.retain(|keyboard| {
+                let ready = revents[index] != 0;
+                index += 1;
+                !ready || locks::read_keyboard(keyboard, &mut seen).is_some()
+            });
+            self.update(seen, bus);
+        }
+    }
+
+    fn poll_leds(&self, watch: Option<&locks::DeviceWatch>, bus: &zbus::blocking::Connection) {
+        let leds = locks::LedFiles::open(Path::new(locks::LEDS));
+        let opened = Instant::now();
+        loop {
+            let every = self.leases.wait_interval();
+            self.update(leds.read(), bus);
+            if watch.is_some_and(|w| w.drain()) || opened.elapsed() >= LED_RESCAN {
+                return;
+            }
+            self.leases.sleep(every);
+        }
+    }
+
+    /// Takes a change the keyboards report, confirmed by Hyprland when running under it
+    fn update(&self, seen: Locks, bus: &zbus::blocking::Connection) {
+        if seen == *self.state.lock().unwrap() {
+            return;
+        }
+        let now = locks::hyprland().unwrap_or(seen);
+        let changes = {
+            let mut state = self.state.lock().unwrap();
+            let before = lock_properties(*state);
+            *state = now;
+            changed(before, lock_properties(now))
+        };
+        emit(bus, LOCKS_PATH, LOCKS_INTERFACE, changes);
+    }
+}
+
+#[derive(Default)]
+struct CompositorState {
+    name: String,
+    ready: bool,
+    state: compositor::State,
+    focus: Option<(String, String)>,
+}
+
+impl CompositorState {
+    fn properties(&self) -> Properties {
+        let text = |json: &serde_json::Value| Value::from(json.to_string());
+        vec![
+            ("Name", self.name.clone().into()),
+            ("Ready", self.ready.into()),
+            ("Workspaces", text(&self.state.workspaces)),
+            ("Windows", text(&self.state.windows)),
+            ("Keyboard", text(&self.state.keyboard)),
+        ]
+    }
+}
+
+pub struct CompositorFeed {
+    pub leases: Leases,
+    session: Mutex<Session>,
+    waker: Waker,
+    state: Mutex<CompositorState>,
+}
+
+impl CompositorFeed {
+    pub fn new() -> Arc<CompositorFeed> {
+        Arc::new(CompositorFeed {
+            leases: Leases::default(),
+            session: Mutex::new(Session::from_env()),
+            waker: Waker::new(),
+            state: Mutex::default(),
+        })
+    }
+
+    pub fn remove(&self, owner: &str) {
+        self.leases.remove(owner);
+        self.waker.wake();
+    }
+
+    /// Follows the session's compositor for a client inside the daemon
+    pub fn add(&self, owner: &str, session: Session) {
+        *self.session.lock().unwrap() = session;
+        self.leases.add(owner, MIN_INTERVAL);
+        self.waker.wake();
+    }
+
+    /// The focused window's class and title; `None` while not connected, `Some(None)` on the desktop
+    pub fn focus(&self) -> Option<Option<(String, String)>> {
+        let state = self.state.lock().unwrap();
+        state.ready.then(|| state.focus.clone())
+    }
+
+    fn publish(&self, bus: &zbus::blocking::Connection, update: impl FnOnce(&mut CompositorState)) {
+        let changes = {
+            let mut state = self.state.lock().unwrap();
+            let before = state.properties();
+            update(&mut state);
+            changed(before, state.properties())
+        };
+        emit(bus, COMPOSITOR_PATH, COMPOSITOR_INTERFACE, changes);
+    }
+
+    /// Follows the compositor of the latest session while anyone watches, and connects again a
+    /// second after it goes away
+    pub fn run(&self, bus: &zbus::blocking::Connection) {
+        loop {
+            self.leases.wait_interval();
+            let session = self.session.lock().unwrap().clone();
+            let name = session.compositor();
+            match compositor::connect(&session) {
+                Some(Ok(adapter)) => self.follow(adapter, &session, bus),
+                Some(Err(error)) => eprintln!("taurus-core: cannot follow {name}: {error}"),
+                None => {
+                    self.publish(bus, |s| {
+                        *s = CompositorState { name: name.to_owned(), ready: true, ..Default::default() }
+                    });
+                    self.wait_while(&session, &[]);
+                    continue;
+                }
+            }
+            self.publish(bus, |s| s.ready = false);
+            if self.current(&session) {
+                self.leases.sleep(RECONNECT);
+            }
+        }
+    }
+
+    fn current(&self, session: &Session) -> bool {
+        self.leases.active() && *self.session.lock().unwrap() == *session
+    }
+
+    /// Waits on `fds` and the waker while the session is current; the indices of readable `fds`
+    fn wait_while(&self, session: &Session, fds: &[i32]) -> Option<Vec<usize>> {
+        let mut all = fds.to_vec();
+        all.push(self.waker.fd());
+        loop {
+            if !self.current(session) {
+                return None;
+            }
+            let revents = locks::wait_readable(&all)?;
+            if revents[fds.len()] != 0 {
+                self.waker.drain();
+                continue;
+            }
+            return Some((0..fds.len()).filter(|i| revents[*i] != 0).collect());
+        }
+    }
+
+    fn follow(&self, mut adapter: Box<dyn compositor::Adapter>, session: &Session, bus: &zbus::blocking::Connection) {
+        let name = session.compositor().to_owned();
+        loop {
+            let (state, focus) = (adapter.state(), adapter.focus());
+            self.publish(bus, |s| *s = CompositorState { name: name.clone(), ready: true, state, focus });
+            let Some(ready) = self.wait_while(session, &adapter.fds()) else { return };
+            for index in ready {
+                if let Err(error) = adapter.read(index) {
+                    eprintln!("taurus-core: lost {name}: {error}");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct BrightnessState {
+    backend: Backend,
+    percent: i32,
+    ready: bool,
+}
+
+impl BrightnessState {
+    fn properties(&self) -> Properties {
+        vec![("Backend", self.backend.name().into()), ("Percent", self.percent.into()), ("Ready", self.ready.into())]
+    }
+}
+
+pub struct BrightnessFeed {
+    pub leases: Leases,
+    waker: Waker,
+    ddc: Ddc,
+    state: Mutex<BrightnessState>,
+    published: Mutex<Properties>,
+}
+
+impl BrightnessFeed {
+    pub fn new() -> Arc<BrightnessFeed> {
+        let state = BrightnessState { backend: Backend::None, percent: -1, ready: false };
+        Arc::new(BrightnessFeed {
+            leases: Leases::default(),
+            waker: Waker::new(),
+            ddc: Ddc::new(&brightness::run_dir()),
+            published: Mutex::new(state.properties()),
+            state: Mutex::new(state),
+        })
+    }
+
+    pub fn remove(&self, owner: &str) {
+        self.leases.remove(owner);
+        self.waker.wake();
+    }
+
+    fn update(&self, update: impl FnOnce(&mut BrightnessState)) {
+        update(&mut self.state.lock().unwrap());
+        self.waker.wake();
+    }
+
+    /// Signals what changed since the last signal
+    fn sync(&self, bus: &zbus::blocking::Connection) {
+        let now = self.state.lock().unwrap().properties();
+        let before = std::mem::replace(&mut *self.published.lock().unwrap(), now.clone());
+        emit(bus, BRIGHTNESS_PATH, BRIGHTNESS_INTERFACE, changed(before, now));
+    }
+
+    /// While anyone watches: reads the brightness, then follows the backlight's files, or for DDC
+    /// takes only the changes made through this daemon
+    pub fn run(&self, bus: &zbus::blocking::Connection) {
+        loop {
+            self.leases.wait_interval();
+            let backend = brightness::backend();
+            let percent = brightness::get(&self.ddc).unwrap_or(-1);
+            *self.state.lock().unwrap() = BrightnessState { backend, percent, ready: true };
+            let watch = (backend == Backend::Backlight).then(|| brightness_watch(brightness::BACKLIGHT)).flatten();
+            loop {
+                self.sync(bus);
+                let mut fds = vec![self.waker.fd()];
+                fds.extend(watch.as_ref().map(AsRawFd::as_raw_fd));
+                let Some(revents) = locks::wait_readable(&fds) else { break };
+                if revents[0] != 0 {
+                    self.waker.drain();
+                }
+                if !self.leases.active() {
+                    break;
+                }
+                if let Some(watch) = watch.as_ref().filter(|_| revents.get(1).is_some_and(|r| *r != 0)) {
+                    drain(watch);
+                    if let Some(device) = brightness::backlight(Path::new(brightness::BACKLIGHT)) {
+                        self.state.lock().unwrap().percent = device.percent();
+                    }
+                }
+            }
+            self.state.lock().unwrap().ready = false;
+            self.sync(bus);
+        }
+    }
+
+    fn change(&self, change: Change) -> fdo::Result<i32> {
+        match brightness::change(&self.ddc, change) {
+            Ok(percent) => {
+                let percent = percent.unwrap_or(-1);
+                self.update(|s| s.percent = percent);
+                Ok(percent)
+            }
+            Err(error) => {
+                if brightness::backend() == Backend::Ddc {
+                    let percent = self.ddc.get().unwrap_or(-1);
+                    self.update(|s| s.percent = percent);
+                }
+                Err(fdo::Error::Failed(error))
+            }
+        }
+    }
+}
+
+/// An inotify descriptor that turns readable when a backlight's brightness is written
+fn brightness_watch(root: &str) -> Option<OwnedFd> {
+    // SAFETY: inotify_init1 has no preconditions; a valid descriptor is owned from here on
+    let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: fd is a fresh descriptor nothing else owns
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let watched = brightness::backlight_files(Path::new(root)).into_iter().filter(|file| {
+        let Ok(path) = std::ffi::CString::new(file.as_os_str().as_encoded_bytes()) else { return false };
+        // SAFETY: path is a valid C string and fd an inotify descriptor
+        unsafe { libc::inotify_add_watch(fd.as_raw_fd(), path.as_ptr(), libc::IN_MODIFY) >= 0 }
+    });
+    (watched.count() > 0).then_some(fd)
+}
+
+fn drain(fd: &OwnedFd) {
+    let mut buf = [0u8; 4096];
+    // SAFETY: buf is writable for its whole length
+    while unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+}
+
+#[derive(Clone, PartialEq)]
+struct NetworkState {
+    connectivity: &'static str,
+    interfaces: String,
+    ready: bool,
+}
+
+impl NetworkState {
+    fn properties(&self) -> Properties {
+        vec![
+            ("Connectivity", self.connectivity.into()),
+            ("Interfaces", self.interfaces.clone().into()),
+            ("Ready", self.ready.into()),
+        ]
+    }
+}
+
+pub struct NetworkFeed {
+    pub leases: Leases,
+    waker: Waker,
+    state: Mutex<NetworkState>,
+    published: Mutex<Properties>,
+}
+
+impl NetworkFeed {
+    pub fn new() -> Arc<NetworkFeed> {
+        let state = NetworkState { connectivity: "unknown", interfaces: "{}".into(), ready: false };
+        Arc::new(NetworkFeed {
+            leases: Leases::default(),
+            waker: Waker::new(),
+            published: Mutex::new(state.properties()),
+            state: Mutex::new(state),
+        })
+    }
+
+    pub fn remove(&self, owner: &str) {
+        self.leases.remove(owner);
+        self.waker.wake();
+    }
+
+    fn set_connectivity(&self, connectivity: &'static str) {
+        self.state.lock().unwrap().connectivity = connectivity;
+        self.waker.wake();
+    }
+
+    fn sync(&self, bus: &zbus::blocking::Connection) {
+        let now = self.state.lock().unwrap().properties();
+        let before = std::mem::replace(&mut *self.published.lock().unwrap(), now.clone());
+        emit(bus, NETWORK_PATH, NETWORK_INTERFACE, changed(before, now));
+    }
+
+    /// While anyone watches: reads the interfaces, then reads them again whenever the kernel signals
+    /// a change of links, addresses or Wi-Fi associations. NetworkManager's connectivity is followed
+    /// alongside, on the system bus.
+    pub fn run(&self, bus: &zbus::blocking::Connection) {
+        std::thread::scope(|scope| {
+            let mut system = None;
+            loop {
+                self.leases.wait_interval();
+                if system.is_none() {
+                    system = zbus::blocking::Connection::system()
+                        .inspect_err(|e| eprintln!("taurus-core: cannot connect to the system bus: {e}"))
+                        .ok();
+                    if let Some(system) = system.clone() {
+                        let follower = system.clone();
+                        scope.spawn(move || self.follow_connectivity(&follower));
+                        scope.spawn(move || self.follow_network_manager(&system));
+                    }
+                }
+                if let Some(system) = &system {
+                    self.set_connectivity(nm_connectivity(system));
+                }
+                let watch = network::Watch::open();
+                {
+                    let mut state = self.state.lock().unwrap();
+                    state.interfaces = watch.interfaces().to_string();
+                    state.ready = true;
+                }
+                loop {
+                    self.sync(bus);
+                    let mut fds = vec![self.waker.fd()];
+                    fds.extend(watch.fds());
+                    let Some(revents) = locks::wait_readable(&fds) else { break };
+                    if revents[0] != 0 {
+                        self.waker.drain();
+                    }
+                    if !self.leases.active() {
+                        break;
+                    }
+                    if revents[1..].iter().any(|r| *r != 0) {
+                        watch.drain();
+                        self.state.lock().unwrap().interfaces = watch.interfaces().to_string();
+                    }
+                }
+                self.state.lock().unwrap().ready = false;
+                self.sync(bus);
+            }
+        });
+    }
+
+    fn follow_connectivity(&self, system: &zbus::blocking::Connection) {
+        let rule = zbus::MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .sender(network::NM_BUS_NAME)
+            .and_then(|r| r.path(network::NM_PATH))
+            .and_then(|r| r.interface(PROPERTIES_INTERFACE))
+            .and_then(|r| r.member("PropertiesChanged"))
+            .map(|r| r.build());
+        let signals = match rule.and_then(|rule| zbus::blocking::MessageIterator::for_match_rule(rule, system, None)) {
+            Ok(signals) => signals,
+            Err(error) => return eprintln!("taurus-core: cannot follow NetworkManager: {error}"),
+        };
+        for message in signals.flatten() {
+            let body = message.body();
+            let Ok((interface, changed, _)) =
+                body.deserialize::<(String, HashMap<String, zbus::zvariant::OwnedValue>, Vec<String>)>()
+            else {
+                continue;
+            };
+            if interface != network::NM_BUS_NAME {
+                continue;
+            }
+            if let Some(Value::U32(state)) = changed.get("Connectivity").map(|v| &**v) {
+                self.set_connectivity(network::connectivity_name(*state));
+            }
+        }
+    }
+
+    /// Forgets the connectivity when NetworkManager stops, and reads it when it starts
+    fn follow_network_manager(&self, system: &zbus::blocking::Connection) {
+        let owners = zbus::blocking::fdo::DBusProxy::new(system)
+            .and_then(|p| p.receive_name_owner_changed_with_args(&[(0, network::NM_BUS_NAME)]));
+        let owners = match owners {
+            Ok(owners) => owners,
+            Err(error) => return eprintln!("taurus-core: cannot follow NetworkManager: {error}"),
+        };
+        for signal in owners {
+            let Ok(args) = signal.args() else { continue };
+            let connectivity = if args.new_owner().is_some() { nm_connectivity(system) } else { "unknown" };
+            self.set_connectivity(connectivity);
+        }
+    }
+}
+
+/// NetworkManager's connectivity, or unknown without NetworkManager, as nmcli would print it
+fn nm_connectivity(system: &zbus::blocking::Connection) -> &'static str {
+    zbus::blocking::Proxy::new(system, network::NM_BUS_NAME, network::NM_PATH, network::NM_BUS_NAME)
+        .and_then(|proxy| proxy.get_property::<u32>("Connectivity"))
+        .map_or("unknown", network::connectivity_name)
+}
+
+#[derive(Default)]
+struct IdleState {
+    inhibition: Inhibition,
+    marker: PathBuf,
+    sleep_lock: bool,
+    logs: Vec<String>,
+    published: bool,
+}
+
+pub struct IdleFeed {
+    pub leases: Leases,
+    state: Mutex<IdleState>,
+    events: Mutex<std::sync::mpsc::Sender<Event>>,
+    receiver: Mutex<Option<std::sync::mpsc::Receiver<Event>>>,
+}
+
+impl IdleFeed {
+    pub fn new() -> Arc<IdleFeed> {
+        let (events, receiver) = std::sync::mpsc::channel();
+        Arc::new(IdleFeed {
+            leases: Leases::default(),
+            state: Mutex::default(),
+            events: Mutex::new(events),
+            receiver: Mutex::new(Some(receiver)),
+        })
+    }
+
+    fn notify(&self, event: Event) {
+        let _ = self.events.lock().unwrap().send(event);
+    }
+
+    fn log(&self, line: String) {
+        self.state.lock().unwrap().logs.push(line);
+        self.notify(Event::Changed);
+    }
+
+    /// A client left the bus: its lease and its inhibitors end
+    pub fn remove(&self, owner: &str) {
+        self.leases.remove(owner);
+        self.state.lock().unwrap().inhibition.cookies.drop_owner(owner);
+        self.notify(Event::Changed);
+    }
+
+    fn signal(bus: &zbus::blocking::Connection, member: &str, text: Option<&str>) {
+        let sent = match text {
+            Some(text) => bus.emit_signal(None::<&str>, IDLE_PATH, IDLE_INTERFACE, member, &(text,)),
+            None => bus.emit_signal(None::<&str>, IDLE_PATH, IDLE_INTERFACE, member, &()),
+        };
+        if let Err(error) = sent {
+            eprintln!("taurus-core: could not signal {member}: {error}");
+        }
+    }
+
+    /// Signals the inhibition when it changed and the log lines gathered meanwhile
+    fn publish(&self, bus: &zbus::blocking::Connection) {
+        let (inhibited, before, logs) = {
+            let mut state = self.state.lock().unwrap();
+            let inhibited = state.inhibition.inhibited(Instant::now());
+            let before = std::mem::replace(&mut state.published, inhibited);
+            (inhibited, before, std::mem::take(&mut state.logs))
+        };
+        for line in logs {
+            Self::signal(bus, "Log", Some(&line));
+        }
+        if inhibited != before {
+            emit(bus, IDLE_PATH, IDLE_INTERFACE, HashMap::from([("Inhibited", Value::from(inhibited))]));
+        }
+    }
+
+    /// Owns org.freedesktop.ScreenSaver and keeps the sleep lock while anyone watches
+    pub fn run(&self, bus: &zbus::blocking::Connection) {
+        let receiver = self.receiver.lock().unwrap().take().expect("the idle feed runs once");
+        let events = self.events.lock().unwrap().clone();
+        self.follow_screensaver_name(bus, events.clone());
+        let mut sleep = SleepLock::default();
+        loop {
+            self.leases.wait_interval();
+            let flags = RequestNameFlags::AllowReplacement | RequestNameFlags::ReplaceExisting;
+            let owner =
+                matches!(bus.request_name_with_flags(idle::SCREENSAVER, flags), Ok(RequestNameReply::PrimaryOwner));
+            self.state.lock().unwrap().inhibition.owner = owner;
+            while self.leases.active() {
+                let (enabled, marker) = {
+                    let state = self.state.lock().unwrap();
+                    (state.sleep_lock, state.marker.clone())
+                };
+                sleep.set_enabled(enabled, &events);
+                sleep.tick(&marker, &events);
+                self.publish(bus);
+                let now = Instant::now();
+                let deadline =
+                    [self.state.lock().unwrap().inhibition.deadline(now), sleep.deadline()].into_iter().flatten().min();
+                let event = match deadline {
+                    Some(at) => receiver.recv_timeout(at.saturating_duration_since(now)).ok(),
+                    None => receiver.recv().ok(),
+                };
+                match event {
+                    Some(Event::PrepareForSleep(sleeping)) if sleep.prepare_for_sleep(sleeping) => {
+                        Self::signal(bus, if sleeping { "Sleep" } else { "Wake" }, None);
+                    }
+                    Some(Event::SystemLost) => sleep.lost(),
+                    Some(Event::ScreenSaverOwned(owned)) => {
+                        let mut state = self.state.lock().unwrap();
+                        state.inhibition.owner = owned;
+                        if !owned {
+                            state.inhibition.reset();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let _ = bus.release_name(idle::SCREENSAVER);
+            sleep.set_enabled(false, &events);
+            {
+                let mut state = self.state.lock().unwrap();
+                state.inhibition.reset();
+                state.inhibition.owner = false;
+                state.sleep_lock = false;
+            }
+            self.publish(bus);
+        }
+    }
+
+    fn follow_screensaver_name(&self, bus: &zbus::blocking::Connection, events: std::sync::mpsc::Sender<Event>) {
+        let Ok(proxy) = zbus::blocking::fdo::DBusProxy::new(bus) else { return };
+        let (Ok(acquired), Ok(lost)) = (proxy.receive_name_acquired(), proxy.receive_name_lost()) else { return };
+        let other = events.clone();
+        std::thread::spawn(move || {
+            for signal in acquired {
+                if signal.args().is_ok_and(|a| a.name() == idle::SCREENSAVER) {
+                    let _ = other.send(Event::ScreenSaverOwned(true));
+                }
+            }
+        });
+        std::thread::spawn(move || {
+            for signal in lost {
+                if signal.args().is_ok_and(|a| a.name() == idle::SCREENSAVER) {
+                    let _ = events.send(Event::ScreenSaverOwned(false));
+                }
+            }
+        });
+    }
+}
+
+/// The variables screen time reads, besides those that locate the compositor
+pub const SCREENTIME_VARS: &[&str] = &[
+    "QS_RUN_FOCUSTIME",
+    "QS_STATE_FOCUSTIME",
+    "QS_SETTINGS",
+    "QS_RUN_LOCK",
+    "QS_RUN_DIR",
+    "TAURUS_DIR",
+    "HOME",
+    "LC_ALL",
+    "LC_MESSAGES",
+    "LANG",
+];
+const SCREENTIME_LEASE: &str = "screentime";
+const SCREENTIME_RETRY: Duration = Duration::from_secs(10);
+
+/// Where screen time keeps its files, from the tracking client's environment
+struct ScreenTimePaths {
+    run: PathBuf,
+    db: PathBuf,
+    home: PathBuf,
+    settings: PathBuf,
+    languages: PathBuf,
+    lock_marker: PathBuf,
+}
+
+impl ScreenTimePaths {
+    fn new(env: &HashMap<String, String>) -> ScreenTimePaths {
+        let var = |name: &str| env.get(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+        let home = var("HOME").unwrap_or_default();
+        let runtime = var("XDG_RUNTIME_DIR").unwrap_or_else(|| "/tmp".into());
+        ScreenTimePaths {
+            run: var("QS_RUN_FOCUSTIME").unwrap_or_else(|| "/tmp/quickshell/focustime".into()),
+            db: var("QS_STATE_FOCUSTIME").unwrap_or_else(|| home.join(".local/state/quickshell/focustime")),
+            settings: var("QS_SETTINGS").unwrap_or_else(|| home.join(".config/taurus/settings.json")),
+            languages: var("TAURUS_DIR").map(|d| d.join("assets/languages")).unwrap_or_default(),
+            lock_marker: var("QS_RUN_LOCK")
+                .unwrap_or_else(|| var("QS_RUN_DIR").unwrap_or_else(|| runtime.join("taurus")).join("lock"))
+                .join("locked"),
+            home,
+        }
+    }
+}
+
+/// The settings file, read again when it changes
+#[derive(Default)]
+struct Settings {
+    modified: Option<std::time::SystemTime>,
+    data: serde_json::Value,
+}
+
+impl Settings {
+    fn refresh(&mut self, path: &Path) {
+        let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified()) else { return };
+        if self.modified == Some(modified) {
+            return;
+        }
+        self.modified = Some(modified);
+        if let Some(data) = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()) {
+            self.data = data;
+        }
+    }
+}
+
+pub struct ScreenTimeFeed {
+    pub leases: Leases,
+    env: Mutex<HashMap<String, String>>,
+    compositor: Arc<CompositorFeed>,
+}
+
+impl ScreenTimeFeed {
+    pub fn new(compositor: Arc<CompositorFeed>) -> Arc<ScreenTimeFeed> {
+        Arc::new(ScreenTimeFeed { leases: Leases::default(), env: Mutex::default(), compositor })
+    }
+
+    /// Counts focus time once a second while anyone tracks, as the shell's focus daemon did
+    pub fn run(&self) {
+        loop {
+            self.leases.wait_interval();
+            let env = self.env.lock().unwrap().clone();
+            let paths = ScreenTimePaths::new(&env);
+            let _ = std::fs::create_dir_all(&paths.run);
+            let _ = std::fs::create_dir_all(&paths.db);
+            screentime::migrate(&paths.db, &paths.home);
+            let conn = match screentime::open(&paths.db.join("focustime.db")) {
+                Ok(conn) => conn,
+                Err(error) => {
+                    eprintln!("taurus-core: cannot open the screen time database: {error}");
+                    self.leases.sleep(SCREENTIME_RETRY);
+                    continue;
+                }
+            };
+            self.compositor.add(SCREENTIME_LEASE, Session::new(env.clone()));
+            let tracker = Tracker::new(conn, paths.run.join("focustime_state.json"));
+            self.track(tracker, &paths, &env);
+            self.compositor.remove(SCREENTIME_LEASE);
+        }
+    }
+
+    fn focused(&self, paths: &ScreenTimePaths) -> (String, String) {
+        let locked = || ("Locked".to_owned(), "Locked".to_owned());
+        if paths.lock_marker.exists() {
+            return locked();
+        }
+        match self.compositor.focus() {
+            Some(Some((class, title))) => {
+                let (class, title) = screentime::classify_window(&class, &title);
+                if class == "hyprlock" { locked() } else { (class, title) }
+            }
+            _ => ("Desktop".to_owned(), "Desktop".to_owned()),
+        }
+    }
+
+    fn track(&self, mut tracker: Tracker, paths: &ScreenTimePaths, env: &HashMap<String, String>) {
+        let mut settings = Settings::default();
+        let mut today = screentime::now().date;
+        let notified_path = paths.db.join("limit_notified.json");
+        let mut notified = Notified::load(&notified_path, today);
+        let mut last = Instant::now();
+        let mut accumulated = 0.0;
+        let mut ticks: u64 = 0;
+        while self.leases.active() {
+            self.leases.sleep(Duration::from_secs(1));
+            if !self.leases.active() {
+                break;
+            }
+            let now = Instant::now();
+            let delta = now.duration_since(last).as_secs_f64();
+            last = now;
+            accumulated += if delta > 3.0 { 1.0 } else { delta };
+            let seconds = accumulated.floor();
+            if seconds < 1.0 {
+                continue;
+            }
+            accumulated -= seconds;
+            ticks += 1;
+            let write = ticks.is_multiple_of(5);
+
+            let date = screentime::now().date;
+            if date != today {
+                today = date;
+                notified = Notified::default();
+                notified.save(&notified_path, today);
+            }
+            if ticks % 5 == 1 {
+                settings.refresh(&paths.settings);
+            }
+            let wellbeing = &settings.data["wellbeing"];
+            let lower = |v: &serde_json::Value| v.as_str().map_or_else(|| v.to_string(), str::to_owned).to_lowercase();
+            let excluded: Vec<String> = wellbeing["excludedApps"].as_array().into_iter().flatten().map(lower).collect();
+            let overall_limit = wellbeing["overallDailyLimit"].as_f64().unwrap_or(0.0);
+            let app_limits: HashMap<String, f64> = wellbeing["appLimits"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(k, v)| (k.to_lowercase(), v.as_f64().unwrap_or(0.0)))
+                .collect();
+
+            let (class, title) = self.focused(paths);
+            let counted =
+                !screentime::SYSTEM_STATES.contains(&class.as_str()) && !excluded.contains(&class.to_lowercase());
+            if !counted {
+                tracker.tick(&class, &title, 0, write);
+                continue;
+            }
+            tracker.tick(&class, &title, seconds as i64, write);
+            let Some(cached) = tracker.cached() else { continue };
+            let lang = screentime::language(&settings.data, env);
+            let text = |key: &str, default: &str, vars: &[(&str, &str)]| {
+                screentime::translate(&paths.languages, &lang, key, default, vars)
+            };
+            let heading = text("guide.wellbeing.notify.title", "Digital wellbeing", &[]);
+            let total = cached["total"].as_i64().unwrap_or(0);
+            if overall_limit > 0.0 && total as f64 >= overall_limit && !notified.overall {
+                let body = text("guide.wellbeing.notify.overall_reached", "Your overall daily limit is reached", &[]);
+                screentime::notify(&heading, &body);
+                notified.overall = true;
+                notified.save(&notified_path, today);
+            }
+            let app = cached["apps"].as_array().into_iter().flatten().find(|a| a["class"] == class.as_str());
+            let app_seconds = app.and_then(|a| a["seconds"].as_i64()).unwrap_or(0);
+            let app_name = app.and_then(|a| a["name"].as_str()).filter(|n| !n.is_empty()).unwrap_or(&title).to_owned();
+            let key = class.to_lowercase();
+            let limit = app_limits.get(&key).copied().unwrap_or(0.0);
+            if limit > 0.0 && app_seconds as f64 >= limit && !notified.apps.contains(&key) {
+                let body = text(
+                    "guide.wellbeing.notify.app_reached",
+                    "Your daily limit for {app} is reached",
+                    &[("app", app_name.as_str())],
+                );
+                screentime::notify(&heading, &body);
+                screentime::emit_limit_event(
+                    &paths.run.join("limit_event.json"),
+                    &class,
+                    &app_name,
+                    app_seconds,
+                    limit as i64,
+                );
+                notified.apps.insert(key);
+                notified.save(&notified_path, today);
+            }
+        }
+        tracker.flush();
+    }
+}
+
+pub struct Core;
+
+#[interface(name = "org.taurus.Core")]
+impl Core {
+    fn quit(&self) {
+        // Exits once the reply is on its way
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(100));
+            std::process::exit(0);
+        });
+    }
+
+    #[zbus(property)]
+    fn version(&self) -> &str {
+        env!("CARGO_PKG_VERSION")
+    }
+}
+
+pub struct SysInfo(pub Arc<SysFeed>);
+
+impl SysInfo {
+    fn usage(&self) -> Usage {
+        self.0.state.lock().unwrap().usage
+    }
+}
+
+#[interface(name = "org.taurus.Core.SysInfo")]
+impl SysInfo {
+    /// Samples every `interval_ms` (or faster, for another client) until this client unsubscribes
+    fn subscribe(&self, #[zbus(header)] header: Header<'_>, interval_ms: u32) -> fdo::Result<()> {
+        self.0.leases.add(&owner(&header)?, interval(interval_ms));
+        Ok(())
+    }
+
+    fn unsubscribe(&self, #[zbus(header)] header: Header<'_>) -> fdo::Result<()> {
+        self.0.leases.remove(&owner(&header)?);
+        Ok(())
+    }
+
+    /// The newest `count` averages over `step` seconds of CPU, memory and temperature as JSON, and
+    /// the milliseconds until the next one completes
+    fn history(&self, step: u32, count: u32) -> (String, u32) {
+        let step = step.clamp(1, 60) as usize;
+        let count = (count as usize).min(history::CAPACITY);
+        let state = self.0.history.lock().unwrap();
+        let ahead = state.history.samples_until_bucket(step).saturating_sub(1);
+        let wait = state.next_sample.saturating_duration_since(Instant::now()) + HISTORY_STEP * ahead as u32;
+        let json = state.history.series(step, count).json().to_string();
+        (json, u32::try_from(wait.as_millis()).unwrap_or(u32::MAX))
+    }
+
+    #[zbus(property)]
+    fn cpu(&self) -> u32 {
+        self.usage().cpu
+    }
+
+    #[zbus(property)]
+    fn ram_percent(&self) -> u32 {
+        self.usage().ram_percent
+    }
+
+    #[zbus(property)]
+    fn ram_gb(&self) -> f64 {
+        self.usage().ram_gb
+    }
+
+    #[zbus(property)]
+    fn temp(&self) -> u32 {
+        self.usage().temp
+    }
+
+    #[zbus(property)]
+    fn net_rx(&self) -> f64 {
+        self.usage().net_rx
+    }
+
+    #[zbus(property)]
+    fn net_tx(&self) -> f64 {
+        self.usage().net_tx
+    }
+
+    #[zbus(property)]
+    fn disk_percent(&self) -> u32 {
+        self.usage().disk.percent
+    }
+
+    #[zbus(property)]
+    fn disk_used_gb(&self) -> f64 {
+        self.usage().disk.used_gb
+    }
+
+    #[zbus(property)]
+    fn disk_total_gb(&self) -> f64 {
+        self.usage().disk.total_gb
+    }
+
+    /// Counts samples, so every sample signals a change even when the values stay the same
+    #[zbus(property)]
+    fn samples(&self) -> u64 {
+        self.0.state.lock().unwrap().samples
+    }
+}
+
+pub struct LockState(pub Arc<LockFeed>);
+
+#[interface(name = "org.taurus.Core.Locks")]
+impl LockState {
+    fn subscribe(&self, #[zbus(header)] header: Header<'_>, interval_ms: u32) -> fdo::Result<()> {
+        self.0.leases.add(&owner(&header)?, interval(interval_ms));
+        Ok(())
+    }
+
+    fn unsubscribe(&self, #[zbus(header)] header: Header<'_>) -> fdo::Result<()> {
+        self.0.leases.remove(&owner(&header)?);
+        Ok(())
+    }
+
+    #[zbus(property)]
+    fn caps_lock(&self) -> bool {
+        self.0.state.lock().unwrap().caps
+    }
+
+    #[zbus(property)]
+    fn num_lock(&self) -> bool {
+        self.0.state.lock().unwrap().num
+    }
+}
+
+pub struct BrightnessControl(pub Arc<BrightnessFeed>);
+
+#[interface(name = "org.taurus.Core.Brightness")]
+impl BrightnessControl {
+    /// Follows the brightness until this client unsubscribes
+    fn subscribe(&self, #[zbus(header)] header: Header<'_>) -> fdo::Result<()> {
+        self.0.leases.add(&owner(&header)?, MIN_INTERVAL);
+        self.0.waker.wake();
+        Ok(())
+    }
+
+    fn unsubscribe(&self, #[zbus(header)] header: Header<'_>) -> fdo::Result<()> {
+        self.0.remove(&owner(&header)?);
+        Ok(())
+    }
+
+    /// The brightness now, read afresh, in percent; -1 when there is nothing to read
+    async fn get(&self) -> i32 {
+        let feed = self.0.clone();
+        blocking::unblock(move || brightness::get(&feed.ddc).unwrap_or(-1)).await
+    }
+
+    /// Sets the brightness in percent and returns what it became
+    async fn set(&self, percent: u32) -> fdo::Result<i32> {
+        let feed = self.0.clone();
+        let percent = percent.min(100) as i32;
+        blocking::unblock(move || feed.change(Change::Set(percent))).await
+    }
+
+    /// Raises (or lowers) the brightness by five percent and returns what it became
+    async fn step(&self, up: bool) -> fdo::Result<i32> {
+        let feed = self.0.clone();
+        blocking::unblock(move || feed.change(Change::Step(up))).await
+    }
+
+    #[zbus(property)]
+    fn backend(&self) -> String {
+        brightness::backend().name().to_owned()
+    }
+
+    /// The brightness last read or set, in percent; -1 when unknown
+    #[zbus(property)]
+    fn percent(&self) -> i32 {
+        self.0.state.lock().unwrap().percent
+    }
+
+    /// False while nobody watches, when `Percent` may be stale
+    #[zbus(property)]
+    fn ready(&self) -> bool {
+        self.0.state.lock().unwrap().ready
+    }
+}
+
+pub struct Network(pub Arc<NetworkFeed>);
+
+#[interface(name = "org.taurus.Core.Network")]
+impl Network {
+    /// Follows the network until this client unsubscribes
+    fn subscribe(&self, #[zbus(header)] header: Header<'_>) -> fdo::Result<()> {
+        self.0.leases.add(&owner(&header)?, MIN_INTERVAL);
+        self.0.waker.wake();
+        Ok(())
+    }
+
+    fn unsubscribe(&self, #[zbus(header)] header: Header<'_>) -> fdo::Result<()> {
+        self.0.remove(&owner(&header)?);
+        Ok(())
+    }
+
+    /// NetworkManager's connectivity: full, limited, portal, none, or unknown without it
+    #[zbus(property)]
+    fn connectivity(&self) -> String {
+        self.0.state.lock().unwrap().connectivity.to_owned()
+    }
+
+    /// JSON text: every interface with its first IPv4 address and, for connected Wi-Fi, its
+    /// frequency in MHz
+    #[zbus(property)]
+    fn interfaces(&self) -> String {
+        self.0.state.lock().unwrap().interfaces.clone()
+    }
+
+    /// False while nobody watches, when the rest may be stale
+    #[zbus(property)]
+    fn ready(&self) -> bool {
+        self.0.state.lock().unwrap().ready
+    }
+}
+
+pub struct Idle(pub Arc<IdleFeed>);
+
+#[interface(name = "org.taurus.Core.Idle")]
+impl Idle {
+    /// Serves org.freedesktop.ScreenSaver until this client unsubscribes. `marker` is the file the
+    /// lock screen creates, which lets a held-back sleep go on.
+    fn subscribe(&self, #[zbus(header)] header: Header<'_>, marker: String) -> fdo::Result<()> {
+        self.0.state.lock().unwrap().marker = marker.into();
+        self.0.leases.add(&owner(&header)?, MIN_INTERVAL);
+        self.0.notify(Event::Changed);
+        Ok(())
+    }
+
+    fn unsubscribe(&self, #[zbus(header)] header: Header<'_>) -> fdo::Result<()> {
+        self.0.remove(&owner(&header)?);
+        Ok(())
+    }
+
+    /// Holds sleep back until the screen is locked, and signals `Sleep` and `Wake`
+    fn set_sleep_lock(&self, enabled: bool) {
+        self.0.state.lock().unwrap().sleep_lock = enabled;
+        self.0.notify(Event::Changed);
+    }
+
+    /// Whether an app asks the session not to idle
+    #[zbus(property)]
+    fn inhibited(&self) -> bool {
+        self.0.state.lock().unwrap().inhibition.inhibited(Instant::now())
+    }
+}
+
+#[derive(Clone)]
+pub struct ScreenSaver(pub Arc<IdleFeed>);
+
+#[interface(name = "org.freedesktop.ScreenSaver")]
+impl ScreenSaver {
+    fn inhibit(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        application_name: String,
+        reason_for_inhibit: String,
+    ) -> fdo::Result<u32> {
+        let sender = owner(&header)?;
+        let cookie = self.0.state.lock().unwrap().inhibition.cookies.add(&sender);
+        self.0.log(format!("inhibit {cookie} from {sender} ({application_name}: {reason_for_inhibit})"));
+        Ok(cookie)
+    }
+
+    fn un_inhibit(&self, cookie: u32) {
+        if self.0.state.lock().unwrap().inhibition.cookies.remove(cookie) {
+            self.0.log(format!("uninhibit {cookie}"));
+        } else {
+            self.0.notify(Event::Changed);
+        }
+    }
+
+    fn simulate_user_activity(&self, #[zbus(header)] header: Header<'_>) -> fdo::Result<()> {
+        let sender = owner(&header)?;
+        let now = Instant::now();
+        let quiet = {
+            let mut state = self.0.state.lock().unwrap();
+            let quiet = state.inhibition.deadline(now).is_none();
+            state.inhibition.activity_until = Some(now + idle::ACTIVITY_HOLD);
+            quiet
+        };
+        if quiet {
+            self.0.log(format!("user activity from {sender}"));
+        } else {
+            self.0.notify(Event::Changed);
+        }
+        Ok(())
+    }
+
+    fn get_active(&self) -> bool {
+        false
+    }
+}
+
+pub struct ScreenTime(pub Arc<ScreenTimeFeed>);
+
+#[interface(name = "org.taurus.Core.ScreenTime")]
+impl ScreenTime {
+    /// Counts focus time until this client unsubscribes. `env` holds the variables of
+    /// `SCREENTIME_VARS` and `compositor::SESSION_VARS`; the latest subscriber's are used.
+    fn subscribe(&self, #[zbus(header)] header: Header<'_>, env: HashMap<String, String>) -> fdo::Result<()> {
+        *self.0.env.lock().unwrap() = env;
+        self.0.leases.add(&owner(&header)?, MIN_INTERVAL);
+        Ok(())
+    }
+
+    fn unsubscribe(&self, #[zbus(header)] header: Header<'_>) -> fdo::Result<()> {
+        self.0.leases.remove(&owner(&header)?);
+        Ok(())
+    }
+}
+
+pub struct Compositor(pub Arc<CompositorFeed>);
+
+#[interface(name = "org.taurus.Core.Compositor")]
+impl Compositor {
+    /// Follows the compositor that `session` names until this client unsubscribes. The variables
+    /// are those of `compositor::SESSION_VARS`; the latest subscriber's session is followed.
+    fn subscribe(&self, #[zbus(header)] header: Header<'_>, session: HashMap<String, String>) -> fdo::Result<()> {
+        self.0.add(&owner(&header)?, Session::new(session));
+        Ok(())
+    }
+
+    fn unsubscribe(&self, #[zbus(header)] header: Header<'_>) -> fdo::Result<()> {
+        self.0.remove(&owner(&header)?);
+        Ok(())
+    }
+
+    #[zbus(property)]
+    fn name(&self) -> String {
+        self.0.state.lock().unwrap().name.clone()
+    }
+
+    /// False while not connected, when the other properties may be stale
+    #[zbus(property)]
+    fn ready(&self) -> bool {
+        self.0.state.lock().unwrap().ready
+    }
+
+    /// JSON: the active workspace, the active one per output and the occupied ones
+    #[zbus(property)]
+    fn workspaces(&self) -> String {
+        self.0.state.lock().unwrap().state.workspaces.to_string()
+    }
+
+    /// JSON: the windows, in the shape the compositor's singleton in the shell keeps
+    #[zbus(property)]
+    fn windows(&self) -> String {
+        self.0.state.lock().unwrap().state.windows.to_string()
+    }
+
+    /// JSON: the keyboard layouts and the active one
+    #[zbus(property)]
+    fn keyboard(&self) -> String {
+        self.0.state.lock().unwrap().state.keyboard.to_string()
+    }
+}
+
+pub struct Clipboard {
+    pub home: PathBuf,
+}
+
+#[interface(name = "org.taurus.Core.Clipboard")]
+impl Clipboard {
+    /// A page of the history as a JSON array; images are decoded into `cache_dir`
+    async fn list(&self, cache_dir: String, offset: u32, limit: u32) -> String {
+        let home = self.home.clone();
+        blocking::unblock(move || clipboard::list(Path::new(&cache_dir), &home, offset as usize, limit as usize)).await
+    }
+
+    async fn toggle_pin(&self, cache_dir: String, id: String) {
+        blocking::unblock(move || clipboard::toggle_pin(Path::new(&cache_dir), &id)).await
+    }
+
+    async fn delete(&self, cache_dir: String, id: String) {
+        blocking::unblock(move || clipboard::delete(Path::new(&cache_dir), &id)).await
+    }
+
+    async fn wipe(&self, cache_dir: String) {
+        blocking::unblock(move || clipboard::wipe(Path::new(&cache_dir))).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_moved_properties_are_signalled() {
+        let before = SysState::default();
+        let mut after = SysState { samples: 1, ..SysState::default() };
+        after.usage.cpu = 12;
+        let changes = changed(before.properties(), after.properties());
+        let mut names: Vec<&str> = changes.keys().copied().collect();
+        names.sort();
+        assert_eq!(names, ["Cpu", "Samples"]);
+    }
+
+    #[test]
+    fn intervals_have_a_floor() {
+        assert_eq!(interval(0), MIN_INTERVAL);
+        assert_eq!(interval(2000), Duration::from_secs(2));
+    }
+}

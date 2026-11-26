@@ -1,0 +1,136 @@
+# taurus-core
+
+A daemon that serves system state, compositor state, network state, brightness, idle inhibition,
+screen time and clipboard history to the
+[Taurus](https://github.com/0x0ar/taurus) shell over D-Bus. The same binary is its
+command line client, which prints everything as JSON, so the shell reads it from one long-running
+process instead of running scripts on a timer. It works on any compositor and needs only a session
+bus. The binary links only glibc.
+
+## Usage
+
+```sh
+taurus-core start                        # the daemon, in the background
+taurus-core sysinfo                      # one sample
+taurus-core watch sysinfo --interval 2   # a sample every 2 seconds until stopped
+taurus-core watch history --interval 2   # the last 60 two-second averages, then each new one
+taurus-core watch locks                  # Caps Lock and Num Lock, now and on every change
+taurus-core watch compositor             # Sway, Niri, Mango or Umbriel workspaces, windows and layout
+taurus-core watch brightness             # brightness in percent and its backend
+taurus-core watch network                # connectivity, IPv4 addresses and Wi-Fi frequencies
+taurus-core brightness set 40            # also get, raise, lower and backend
+taurus-core watch idle "$XDG_RUNTIME_DIR/taurus/lock/locked"
+taurus-core screentime track             # count screen time while running
+taurus-core screentime stats 2026-11-06  # a day's screen time statistics
+taurus-core launcher rank                # launcher scores from screen time and launches
+taurus-core launcher files notes         # files for the launcher's file search
+taurus-core monitors                     # outputs in use with their size and refresh rate
+taurus-core wallpaper index ~/Pictures/Wallpapers "$XDG_CACHE_HOME/taurus/wallpaper"
+taurus-core presets list "$XDG_STATE_HOME/taurus/presets" "$XDG_STATE_HOME/taurus/widgets"
+taurus-core system can-hibernate
+taurus-core clipboard list 0 12          # the newest 12 clipboard entries
+taurus-core clipboard pin 42
+taurus-core clipboard delete 42
+taurus-core clipboard wipe
+taurus-core notify --app Shot --action default=Open "Saved" "In ~/Pictures"
+taurus-core quit
+```
+
+`taurus-core --help` lists every command. Every command except `quit`, `notify`, `wallpaper` and `presets` starts
+the daemon when it is not running, and `watch` starts it again if it goes away.
+
+Feeds cost nothing while nobody watches them: the daemon samples only while a client holds a lease,
+and the lease ends when that client exits. When several clients watch the same feed, it samples at
+the shortest interval any of them asked for.
+
+Caps Lock and Num Lock follow the keyboards' LED events when `/dev/input` can be read, as for
+members of the `input` group, and nothing runs between changes. Otherwise the LEDs in
+`/sys/class/leds` are polled every 250 ms while someone watches, since the kernel signals no changes
+there. On Hyprland every change is checked against Hyprland's main keyboard, which ignores LED
+flicker from other keyboards.
+
+The compositor feed speaks each compositor's own socket: Sway's i3-ipc, Niri's JSON socket,
+Mango's IPC socket and Umbriel's, so following them costs no processes. Every watcher passes the
+variables that locate its compositor, because the daemon may outlive a login. Of Hyprland, which the
+shell reads natively, only the focused window is followed, for screen time.
+
+`monitors` asks the same sockets, and Hyprland's, for the outputs in use. On other compositors it
+asks for the Wayland outputs (`wl_output` 4 or later), and without a compositor it lists the
+connectors the kernel reports connected.
+
+Brightness drives the first backlight in `/sys/class/backlight`, through logind when its file is
+not writable, else the first DDC/CI display through `ddcutil`. `watch idle` serves
+`org.freedesktop.ScreenSaver` while it runs, and with `sleep-lock on` on its standard input holds a
+logind sleep delay inhibitor until the lock screen's marker file appears. Screen time counts the
+focused app once a second into the shell's sqlite database, and notifies when a daily limit from
+the shell's settings is reached.
+
+`notify` sends a notification to whichever server owns `org.freedesktop.Notifications` on the
+session bus, with `--app`, `--icon` and `--urgency`. Each `--action NAME=LABEL` adds a button. With
+buttons it waits and prints the name of the one clicked, or exits printing nothing when the
+notification closes or the server leaves the bus. It sends what libnotify's `notify-send` sends for
+the same options, icon in the `image-path` hint and app name `notify-send` unless given, which the
+tests check against `notify-send` itself.
+
+`watch network` prints NetworkManager's connectivity (`full`, `limited`, `portal`, `none`, or
+`unknown` without NetworkManager) and, for every interface, its first IPv4 address and, when it is
+connected Wi-Fi, its frequency in MHz. Addresses and frequencies come from the kernel through
+rtnetlink and nl80211, so they work under iwd or systemd-networkd too, and their changes arrive as
+netlink events, so nothing is polled.
+
+`wallpaper index` lists the images (JPEG, PNG, WebP, GIF, BMP) and videos in a folder with each
+image's average colour and colour bucket, and a poster frame of each video made with `ffmpeg`.
+Images the decoders here cannot read go to ImageMagick's `magick` or `convert` when installed.
+Files that kept their mtime and size are taken from the previous index, so a second run only
+decodes what changed. A lock in the run directory, the third argument, lets one run index a folder
+at a time; a run that finds it taken prints the last index and makes the running one index again.
+
+`presets MODE PRESETS_DIR WIDGETS_DIR [PRESET_PATH] [JSON]` manages the shell's settings presets and
+prints them as one JSON array, oldest first, each with its file name as `id`. `save` stores the JSON
+as the preset `PRESET_PATH` together with the layouts of `WIDGETS_DIR/*/layout.json`, and deletes the
+screenshots the old file used and the new one does not. `widgets` replaces the widgets snapshot of
+`PRESET_PATH` with the JSON and prints nothing, `delete` removes a preset and its screenshots, and
+`list` only lists. Files are written through a temporary file and a rename.
+
+The clipboard commands read the history from [cliphist](https://github.com/sentriz/cliphist), which
+must be installed. Decoded images and pins are kept in `--cache-dir`, by default
+`$XDG_CACHE_HOME/taurus/clipboard`.
+
+## D-Bus
+
+| Object       | Interface                        | Members                                                                                                         |
+|--------------|----------------------------------|-----------------------------------------------------------------------------------------------------------------|
+| `/`          | `org.taurus.Core`           | `Quit()`, `Version`                                                                                             |
+| `/sysinfo`   | `org.taurus.Core.SysInfo`   | `Subscribe(u interval_ms)`, `Unsubscribe()`, `Cpu`, `RamPercent`, `RamGb`, `Temp`, `NetRx`, `NetTx`, `DiskPercent`, `DiskUsedGb`, `DiskTotalGb`, `Samples` |
+| `/locks`     | `org.taurus.Core.Locks`     | `Subscribe(u interval_ms)`, `Unsubscribe()`, `CapsLock`, `NumLock`                                              |
+| `/clipboard` | `org.taurus.Core.Clipboard` | `List(s cache_dir, u offset, u limit) → s`, `TogglePin(s cache_dir, s id)`, `Delete(s cache_dir, s id)`, `Wipe(s cache_dir)` |
+| `/compositor` | `org.taurus.Core.Compositor` | `Subscribe(a{ss} session)`, `Unsubscribe()`, `Name`, `Ready`, `Workspaces`, `Windows`, `Keyboard` (the last three JSON text) |
+| `/brightness` | `org.taurus.Core.Brightness` | `Subscribe()`, `Unsubscribe()`, `Get() → i`, `Set(u percent) → i`, `Step(b up) → i`, `Backend`, `Percent`, `Ready` |
+| `/idle` | `org.taurus.Core.Idle` | `Subscribe(s marker)`, `Unsubscribe()`, `SetSleepLock(b)`, `Inhibited`; signals `Sleep`, `Wake`, `Log(s)` |
+| `/network` | `org.taurus.Core.Network` | `Subscribe()`, `Unsubscribe()`, `Connectivity`, `Interfaces` (JSON text), `Ready` |
+| `/screentime` | `org.taurus.Core.ScreenTime` | `Subscribe(a{ss} env)`, `Unsubscribe()` |
+| `/org/freedesktop/ScreenSaver`, `/ScreenSaver` | `org.freedesktop.ScreenSaver` | `Inhibit`, `UnInhibit`, `SimulateUserActivity`, `GetActive`, while `watch idle` runs |
+
+Properties signal `PropertiesChanged`. `Samples` counts samples, so each sample signals a change
+even when the values stay the same.
+
+```sh
+busctl --user call org.taurus.Core /sysinfo org.taurus.Core.SysInfo Subscribe u 1000
+busctl --user get-property org.taurus.Core /sysinfo org.taurus.Core.SysInfo Cpu
+```
+
+## Building
+
+```sh
+nix-shell        # or any Rust toolchain with edition 2024
+cargo build --release
+packaging/stage.sh /tmp/stage   # lays out usr/bin, the D-Bus service file and the licence
+```
+
+On NixOS, `pkgs.callPackage ./default.nix { }` installs the latest release binary, and
+`{ fromSource = true; }` compiles this checkout. Adding the package to `services.dbus.packages`
+lets D-Bus start the daemon on first use.
+
+## License
+
+AGPL-3.0-or-later
